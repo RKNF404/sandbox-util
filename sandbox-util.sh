@@ -60,8 +60,6 @@ if [[ "$WINDOW_SYSTEM" != "none" && "$WINDOW_SYSTEM" != "any" &&
 	WINDOW_SYSTEM="$XDG_SESSION_TYPE"
 fi
 
-declare -r TRUE="true"
-declare -r FALSE="false"
 # Checks if a specific param is present in the params list
 function sandbox_param_present() {
 	echo "$SANDBOX_PARAMS" | grep -F -x "$1"
@@ -146,7 +144,7 @@ function determine_sandbox_args() {
 	
 	### GROUP_RO_ACCESS
 	# prevent system ld preload
-	sandbox_param_enabled "preventpreload" >/dev/null && nullify_file "/etc/ld.so.preload"
+	sandbox_param_enabled "preventpreload" >/dev/null&& nullify_file "/etc/ld.so.preload"
 	# /usr access
 	if sandbox_param_enabled "hideusr" >/dev/null; then
 		nullify_dir "/usr"
