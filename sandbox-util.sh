@@ -1,22 +1,39 @@
 #!/usr/bin/env bash
 
-[[ ! "$1" ]] && echo "ERROR: no params provided" && exit 1
-
+# Make a few environment variables immediately immutable
 declare -r HOME="$HOME"
 declare -r XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"
 declare -r XAUTHORITY="$XAUTHORITY"
 declare -r XDG_SESSION_TYPE="$XDG_SESSION_TYPE"
 
-if [[ "$1" == "--help" || "$1" == "-h" ]]; then
-	echo "Help Statement"
-	exit 0
-fi
+# If we have nothing, do nothing
+[[ ! "$1" || ! "$2" ]] && echo "ERROR: no params provided" && exit 1
+
+# Determine what kind of thing we are running
+declare EXEC_TYPE="unknown"
+case "$1" in
+	--help|-h)
+		echo "Help Statement"
+		exit 0
+		;;
+	--command|-c)
+		EXEC_TYPE="command"
+		;;
+	--file|-f)
+		EXEC_TYPE="file"
+		;;
+	*)
+		echo "ERROR: '$1' unrecognized argument"
+		exit 1
+		;;
+esac
 
 # Command variables
-declare -r COMMAND="$1"
-declare -r COMMAND_ARGS="${@:2}"
+declare -r EXEC="$2"
+declare -r EXEC_ARGS="${@:3}"
 declare -r BWRAP_BIN="/usr/bin/bwrap"
 declare BWRAP_ARGS="--cap-drop ALL"
+declare EXEC_NAME="$2"
 
 # Prints the contents of $1 in an nl separated list
 # - converts if from comma separated to nl separated
@@ -25,10 +42,10 @@ function params_list() {
 }
 
 # PACKAGE and USER do the same thing
-# - APPLICATION is supposed to be predefined by the app or not changed
+# - APPLICATION is supposed to be predefined by the app and not changed
 # - USER is for user overrides
-declare -r SANDBOX_PARAMS="$(params_list $(params_list $SB_APPLICATION_SANDBOX_PARAMS),$(params_list $SB_USER_SANDBOX_PARAMS))"
-echo "$SANDBOX_PARAMS"
+declare -r SANDBOX_PARAMS="$(params_list "$SB_APPLICATION_SANDBOX_PARAMS,$SB_USER_SANDBOX_PARAMS")"
+#echo "$SANDBOX_PARAMS"
 
 # Directory/device access vars
 declare -r HOME_ACCESS="$(params_list $SB_HOME_RW_ACCESS)" # HOME relative rw access paths
@@ -36,16 +53,18 @@ declare -r RO_ACCESS="$(params_list $SB_RO_ACCESS)" # any path granted read-only
 declare -r DEV_ACCESS="$(params_list $SB_DEV_ACCESS)" # grants access to any device in /dev
 declare -r SOCKET_ACCESS="$(params_list $SB_SOCKET_ACCESS)" # XDG_RUNTIME_DIR relative socket access
 
-# Figure out what window system we need to use
+# Figure out what window system we are using
 declare WINDOW_SYSTEM="${SB_WINDOWING_SYSTEM:-$XDG_SESSION_TYPE}"
 if [[ "$WINDOW_SYSTEM" != "none" && "$WINDOW_SYSTEM" != "any" &&
       "$WINDOW_SYSTEM" != "x11" && "$WINDOW_SYSTEM" != "wayland" ]]; then
 	WINDOW_SYSTEM="$XDG_SESSION_TYPE"
 fi
 
+declare -r TRUE="true"
+declare -r FALSE="false"
 # Checks if a specific param is present in the params list
 function sandbox_param_present() {
-	echo "$SANDBOX_PARAMS" | grep -F -x -q "$1"
+	echo "$SANDBOX_PARAMS" | grep -F -x "$1"
 }
 # Sandbox parsing logic
 # - By default all protections should be on
@@ -80,7 +99,7 @@ function nullify_file() {
 	[[ -f "$1" ]] && BWRAP_ARGS+=" --ro-bind /dev/null $1"
 }
 function nullify_dir() {
-	[[ -d "$1" ]] && BWRAP_ARGS+=" --perms 444" && clear_dir "$1"
+	[[ -d "$1" ]] && clear_dir "$1" && BWRAP_ARGS+=" --remount-ro $1"
 }
 function grant_home_rw_access() {
 	[[ -f "$1" || -d "$1" ]] && raw_grant "$HOME/$1"
@@ -89,7 +108,7 @@ function grant_socket_access() {
 	[[ -f "$1" || -d "$1" ]] && grant_ro_access "$XDG_RUNTIME_DIR/$1"
 }
 
-# WIP BELOW
+# General sandbox function
 function determine_sandbox_args() {
 	local -r IS_EPHEMERAL="$(sandbox_param_allowed "ephemeral")"
 	
@@ -97,47 +116,73 @@ function determine_sandbox_args() {
 	sandbox_param_present "nosandbox" >/dev/null && BWRAP_ARGS+=" --dev-bind / /"
 	BWRAP_ARGS+=" --unshare-user-try"
 	BWRAP_ARGS+=" --unshare-cgroup-try"
-	sandbox_param_enabled "unshareuts" >/dev/null && BWRAP_ARGS+=" --unshare-uts --hostname secureblue"
+	sandbox_param_enabled "unshareuts" >/dev/null && BWRAP_ARGS+=" --unshare-uts --hostname sandbox"
 	sandbox_param_enabled "unsharenetwork" >/dev/null && BWRAP_ARGS+=" --unshare-net"
 	sandbox_param_enabled "newsession" >/dev/null && BWRAP_ARGS+=" --new-session"
+	# /proc and process access
+	BWRAP_ARGS+=" --proc /proc"
+	if sandbox_param_enabled "unshareprocesses" >/dev/null; then
+		BWRAP_ARGS+=" --unshare-pid"
+	fi
+	
+	grant_ro_access "$BWRAP_BIN"
+	case "$EXEC_TYPE" in
+		command)
+			# We do not known where in PATH the command is from
+			# Grants access to some common dirs and hope it works
+			grant_ro_access "/usr/bin/$EXEC"
+			grant_ro_access "/usr/sbin/$EXEC"
+			EXEC_NAME="/usr/bin/$EXEC"
+			;;
+		file)
+			grant_ro_access "$EXEC"
+			EXEC_NAME="$EXEC"
+			;;
+		*)
+			echo "ERROR: exec type '$EXEC_TYPE' unknown"
+			exit 0
+			;;
+	esac
 	
 	### GROUP_RO_ACCESS
 	# prevent system ld preload
 	sandbox_param_enabled "preventpreload" >/dev/null && nullify_file "/etc/ld.so.preload"
-	# /proc and process access
-	BWRAP_ARGS+=" --proc /proc"
-	if sandbox_param_enabled "hideprocesses" >/dev/null; then
-		BWRAP_ARGS+=" --unshare-pid"
+	# /usr access
+	if sandbox_param_enabled "hideusr" >/dev/null; then
+		nullify_dir "/usr"
+	else
+		grant_ro_access "/usr"
 	fi
 	# /bin access
 	if sandbox_param_enabled "hidebin" >/dev/null; then
-		#nullify_dir "/bin"
-		grant_ro_access "$BWRAP_BIN"
-		grant_ro_access "/bin/$COMMAND"
+		nullify_dir "/usr/bin"
 	else
-		grant_ro_access "/bin"
+		grant_ro_access "/usr/bin"
 	fi
 	# /sbin access
 	if sandbox_param_enabled "hidesbin" >/dev/null; then
-		nullify_dir "/sbin"
-		grant_ro_access "/sbin/$COMMAND"
-		echo "lmao"
+		nullify_dir "/usr/sbin"
 	else
-		grant_ro_access "/sbin"
+		grant_ro_access "/usr/sbin"
 	fi
+	# /lib64 and /lib access
+	if sandbox_param_enabled "hidelib" >/dev/null; then
+		nullify_dir "/usr/lib64"
+		nullify_dir "/usr/lib"
+	else
+		grant_ro_access "/usr/lib64"
+		grant_ro_access "/usr/lib"
+	fi
+	# On Fedora, these dirs are symlinked
+	BWRAP_ARGS+=" --symlink /usr/bin /bin"
+	BWRAP_ARGS+=" --symlink /usr/sbin /sbin"
+	BWRAP_ARGS+=" --symlink /usr/lib64 /lib64"
+	BWRAP_ARGS+=" --symlink /usr/lib /lib"
 	# /etc access
 	if sandbox_param_enabled "hideetc" >/dev/null; then
 		nullify_dir "/etc"
 	else
 		grant_ro_access "/etc"
-	fi
-	# /lib64 and /lib access
-	if sandbox_param_enabled "hidelib" >/dev/null; then
-		nullify_dir "/lib64"
-		nullify_dir "/lib"
-	else
-		grant_ro_access "/lib64"
-		grant_ro_access "/lib"
 	fi
 	# /tmp access
 	if sandbox_param_enabled "hidetmp" >/dev/null || [[ "$IS_EPHEMERAL" ]]; then
@@ -169,12 +214,6 @@ function determine_sandbox_args() {
 		nullify_dir "/var"
 	else
 		grant_ro_access "/var"
-	fi
-	# /usr access
-	if sandbox_param_enabled "hideusr" >/dev/null; then
-		nullify_dir "/usr"
-	else
-		grant_ro_access "/usr"
 	fi
 	# custom defined access
 	for path in "$RO_ACCESS"; do
@@ -217,6 +256,12 @@ function determine_sandbox_args() {
 	sandbox_param_allowed "allowgpu" >/dev/null && grant_device_access "dri"
 	# usb access
 	sandbox_param_allowed "allowusb" >/dev/null && grant_device_access "usb"
+	# shared memory access
+	if sandbox_param_allowed "allowshm" >/dev/null; then
+		grant_device_access "shm"
+	else
+		nullify_dir "/dev/shm"
+	fi
 	# custom defined access
 	for device in "$DEVICE_ACCESS"; do
 		grant_device_access "$device"
@@ -279,6 +324,6 @@ determine_sandbox_args
 
 BWRAP_ARGS+=" --"
 
-echo "$BWRAP_BIN $BWRAP_ARGS $COMMAND $COMMAND_ARGS"
+echo "$EXEC_NAME $BWRAP_BIN $BWRAP_ARGS $EXEC $EXEC_ARGS"
 
-exec -a "$COMMAND" $BWRAP_BIN $BWRAP_ARGS "$COMMAND" $COMMAND_ARGS
+exec -a "$EXEC_NAME" $BWRAP_BIN $BWRAP_ARGS "$EXEC" $EXEC_ARGS
