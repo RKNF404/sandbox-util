@@ -45,7 +45,6 @@ function params_list() {
 # - APPLICATION is supposed to be predefined by the app and not changed
 # - USER is for user overrides
 declare -r SANDBOX_PARAMS="$(params_list "$SB_APPLICATION_SANDBOX_PARAMS,$SB_USER_SANDBOX_PARAMS")"
-#echo "$SANDBOX_PARAMS"
 
 # Directory/device access vars
 declare -r HOME_ACCESS="$(params_list $SB_HOME_RW_ACCESS)" # HOME relative rw access paths
@@ -71,13 +70,13 @@ function sandbox_param_present() {
 # - `nosandbox` will switch the default from on-by-default to off-by-default
 # - `sandbox` will switch to enforce-by-default, which will present all bypass
 function sandbox_param_enabled() {
-	! sandbox_param_present "no$1" && ! sandbox_param_present "nosandbox" && echo "$1"
-	sandbox_param_present "$1" || sandbox_param_present "sandbox"
+	[[ -z "$(sandbox_param_present "no$1")" && -z "$(sandbox_param_present "nosandbox")" ]] && echo "$1"
+	[[ -n "$(sandbox_param_present "$1")" || -n "$(sandbox_param_present "sandbox")" ]] && echo "$1"
 }
 # Similar to sandbox_param_enabled except it is off by default and is used for grants rather than restrictions
 # - denying is enforced
 function sandbox_param_allowed() {
-	! sandbox_param_present "no$1" && sandbox_param_present "$1"
+	[[ -z "$(sandbox_param_present "no$1")" && -n "$(sandbox_param_present "$1")" ]] && echo "$1"
 }
 
 # Some general purpose access functions
@@ -88,7 +87,7 @@ function grant_ro_access() {
 	[[ -f "$1" || -d "$1" ]] && BWRAP_ARGS+=" --ro-bind $1 $1"
 }
 function clear_dir() {
-	[[ -d "$1" ]] && BWRAP_ARGS+=" --tmpfs $1"
+	[[ -d "$1" ]] && BWRAP_ARGS+=" --perms 444 --tmpfs $1"
 }
 function grant_device_access() {
 	[[ -f "$1" || -d "$1" ]] && BWRAP_ARGS+=" --dev-bind /dev/$1 /dev/$1"
@@ -97,7 +96,7 @@ function nullify_file() {
 	[[ -f "$1" ]] && BWRAP_ARGS+=" --ro-bind /dev/null $1"
 }
 function nullify_dir() {
-	[[ -d "$1" ]] && clear_dir "$1" && BWRAP_ARGS+=" --remount-ro $1"
+	[[ -d "$1" ]] && clear_dir "$1" && NULLIFY_DIRS+="$1,"
 }
 function grant_home_rw_access() {
 	[[ -f "$1" || -d "$1" ]] && raw_grant "$HOME/$1"
@@ -111,180 +110,150 @@ function determine_sandbox_args() {
 	local -r IS_EPHEMERAL="$(sandbox_param_allowed "ephemeral")"
 	
 	# allow everything with no sandbox
-	sandbox_param_present "nosandbox" >/dev/null && BWRAP_ARGS+=" --dev-bind / /"
-	BWRAP_ARGS+=" --unshare-user-try"
-	BWRAP_ARGS+=" --unshare-cgroup-try"
-	sandbox_param_enabled "unshareuts" >/dev/null && BWRAP_ARGS+=" --unshare-uts --hostname sandbox"
-	sandbox_param_enabled "unsharenetwork" >/dev/null && BWRAP_ARGS+=" --unshare-net"
-	sandbox_param_enabled "newsession" >/dev/null && BWRAP_ARGS+=" --new-session"
-	# /proc and process access
-	BWRAP_ARGS+=" --proc /proc"
-	if sandbox_param_enabled "unshareprocesses" >/dev/null; then
-		BWRAP_ARGS+=" --unshare-pid"
-	fi
+	[[ -n "$(sandbox_param_present "nosandbox")" ]] && BWRAP_ARGS+=" --dev-bind / /"
+	BWRAP_ARGS+=" --unshare-user"
+	BWRAP_ARGS+=" --unshare-cgroup"
+	[[ -n "$(sandbox_param_enabled "unshareuts")" ]] && BWRAP_ARGS+=" --unshare-uts --hostname sandbox"
+	[[ -n "$(sandbox_param_enabled "unsharenetwork")" ]] && BWRAP_ARGS+=" --unshare-net"
+	[[ -n "$(sandbox_param_enabled "newsession")" ]] && BWRAP_ARGS+=" --new-session"
 	
-	grant_ro_access "$BWRAP_BIN"
-	case "$EXEC_TYPE" in
-		command)
-			# We do not known where in PATH the command is from
-			# Grants access to some common dirs and hope it works
-			grant_ro_access "/usr/bin/$EXEC"
-			grant_ro_access "/usr/sbin/$EXEC"
-			EXEC_NAME="/usr/bin/$EXEC"
-			;;
-		file)
-			grant_ro_access "$EXEC"
-			EXEC_NAME="$EXEC"
-			;;
-		*)
-			echo "ERROR: exec type '$EXEC_TYPE' unknown"
-			exit 0
-			;;
-	esac
+	# /proc & process access
+	BWRAP_ARGS+=" --proc /proc"
+	[[ -n "$(sandbox_param_enabled "unshareprocesses")" ]] && BWRAP_ARGS+=" --unshare-pid"
 	
 	### GROUP_RO_ACCESS
 	# prevent system ld preload
-	sandbox_param_enabled "preventpreload" >/dev/null&& nullify_file "/etc/ld.so.preload"
-	# /usr access
-	if sandbox_param_enabled "hideusr" >/dev/null; then
-		nullify_dir "/usr"
-	else
-		grant_ro_access "/usr"
-	fi
-	# /bin access
-	if sandbox_param_enabled "hidebin" >/dev/null; then
-		nullify_dir "/usr/bin"
-	else
-		grant_ro_access "/usr/bin"
-	fi
+	[[ -n "$(sandbox_param_enabled "preventpreload")" ]] && nullify_file "/etc/ld.so.preload"
+	# /usr access (mandatory)
+	grant_ro_access "/usr"
+	grant_ro_access "/usr/bin"
 	# /sbin access
-	if sandbox_param_enabled "hidesbin" >/dev/null; then
+	if [[ -n "$(sandbox_param_enabled "hidesbin")" ]]; then
 		nullify_dir "/usr/sbin"
 	else
 		grant_ro_access "/usr/sbin"
 	fi
 	# /lib64 and /lib access
-	if sandbox_param_enabled "hidelib" >/dev/null; then
+	if [[ -n "$(sandbox_param_enabled "hidelib")" ]]; then
 		nullify_dir "/usr/lib64"
 		nullify_dir "/usr/lib"
 	else
 		grant_ro_access "/usr/lib64"
 		grant_ro_access "/usr/lib"
 	fi
+	if [[ -n "$(sandbox_param_enabled "hidelibexec")" ]]; then
+		nullify_dir "/usr/libexec"
+	else
+		grant_ro_access "/usr/libexec"
+	fi
 	# On Fedora, these dirs are symlinked
-	BWRAP_ARGS+=" --symlink /usr/bin /bin"
-	BWRAP_ARGS+=" --symlink /usr/sbin /sbin"
-	BWRAP_ARGS+=" --symlink /usr/lib64 /lib64"
-	BWRAP_ARGS+=" --symlink /usr/lib /lib"
+	BWRAP_ARGS+=" --ro-bind /usr/bin /bin"
+	BWRAP_ARGS+=" --ro-bind /usr/sbin /sbin"
+	BWRAP_ARGS+=" --ro-bind /usr/lib64 /lib64"
+	BWRAP_ARGS+=" --ro-bind /usr/lib /lib"
 	# /etc access
-	if sandbox_param_enabled "hideetc" >/dev/null; then
+	if [[ -n "$(sandbox_param_enabled "hideetc")" ]]; then
 		nullify_dir "/etc"
 	else
 		grant_ro_access "/etc"
 	fi
 	# /tmp access
-	if sandbox_param_enabled "hidetmp" >/dev/null || [[ "$IS_EPHEMERAL" ]]; then
+	if [[ -n "$(sandbox_param_enabled "hidetmp")" || -n "$IS_EPHEMERAL" ]]; then
 		clear_dir "/tmp"
 	else
 		raw_grant "/tmp"
 	fi
 	# /sys access
-	if sandbox_param_enabled "hidesys" >/dev/null; then
+	if [[ -n "$(sandbox_param_enabled "hidesys")" ]]; then
 		nullify_dir "/sys"
 	else
 		grant_ro_access "/sys"
 	fi
 	# /run access
-	if sandbox_param_enabled "hiderun" >/dev/null; then
+	if [[ -n "$(sandbox_param_enabled "hiderun")" ]]; then
 		nullify_dir "/run"
-		! sandbox_param_enabled "unsharenetwork" >/dev/null && grant_ro_access "/run/systemd/resolve"
+		[[ -z "$(sandbox_param_enabled "unsharenetwork")" ]] && grant_ro_access "/run/systemd/resolve"
 	else
 		grant_ro_access "/run"
 	fi
-	# /home access
-	if sandbox_param_enabled "hideallhome" >/dev/null; then
-		nullify_dir "/home"
-	else
-		grant_ro_access "/home"
-	fi
 	# /var access
-	if sandbox_param_enabled "hidevar" >/dev/null; then
+	if [[ -n "$(sandbox_param_enabled "hidevar")" ]]; then
 		nullify_dir "/var"
 	else
 		grant_ro_access "/var"
 	fi
 	# custom defined access
-	for path in "$RO_ACCESS"; do
+	for path in $RO_ACCESS; do
 		grant_ro_access "$path"
 	done
 	### END_GROUP_RO_ACCESS
 	
 	### GROUP_SOCKET_ACCESS
 	# XDG_RUNTIME_DIR access
-	if sandbox_param_enabled "hidesockets" >/dev/null; then
+	if [[ -n "$(sandbox_param_enabled "hidesockets")" ]]; then
 		nullify_dir "$XDG_RUNTIME_DIR"
 	else
 		grant_ro_access "$XDG_RUNTIME_DIR"
 	fi
 	# pipewire access
-	sandbox_param_allowed "allowpipewire" && grant_socket_access "pipewire-0"
+	[[ -n "$(sandbox_param_allowed "allowpipewire")" ]] && grant_socket_access "pipewire-0"
 	# pulseaudio access
-	sandbox_param_allowed "allowpulseaudio" && grant_socket_access "pulse"
+	[[ -n "$(sandbox_param_allowed "allowpulse")" ]] && grant_socket_access "pulse"
 	if sandbox_param_allowed "allowdconf" >/dev/null; then
-		if [[ "$IS_EPHEMERAL" ]]; then
+		if [[ -n "$IS_EPHEMERAL" ]]; then
 			grant_socket_access "dconf"
 		else
 			raw_grant "$XDG_RUNTIME_DIR/dconf"
 		fi
 	fi
 	# custom defined access
-	for socket in "$SOCKET_ACCESS"; do
+	for socket in $SOCKET_ACCESS; do
 		grant_socket_access "$socket"
 	done
 	### END_GROUP_SOCKET_ACCESS
 	
 	### GROUP_DEVICE_ACCESS
 	# /dev access
-	if sandbox_param_enabled "hidedevices" >/dev/null; then
+	if [[ -n "$(sandbox_param_enabled "hidedevices")" ]]; then
 		BWRAP_ARGS+=" --dev /dev"
 	else
 		BWRAP_ARGS+=" --dev-bind /dev /dev"
 	fi
 	# gpu access
-	sandbox_param_allowed "allowgpu" >/dev/null && grant_device_access "dri"
+	[[ -n "$(sandbox_param_allowed "allowgpu")" ]] && grant_device_access "dri"
 	# usb access
-	sandbox_param_allowed "allowusb" >/dev/null && grant_device_access "usb"
+	[[ -n "$(sandbox_param_allowed "allowusb")" ]] && grant_device_access "usb"
 	# shared memory access
-	if sandbox_param_allowed "allowshm" >/dev/null; then
+	if [[ -n "$(sandbox_param_allowed "allowshm")" ]]; then
 		grant_device_access "shm"
 	else
 		nullify_dir "/dev/shm"
 	fi
 	# custom defined access
-	for device in "$DEVICE_ACCESS"; do
+	for device in $DEVICE_ACCESS; do
 		grant_device_access "$device"
 	done
 	### END_GROUP_DEVICE_ACCESS
 	
 	### GROUP_HOME_RW_ACCESS
-	if [[ "$IS_EPHEMERAL" ]]; then
+	if [[ -n "$IS_EPHEMERAL" ]]; then
 		clear_dir "$HOME"
-	elif sandbox_param_enabled "protecthome" >/dev/null; then
+	elif [[ -n "$(sandbox_param_enabled "protecthome")" ]]; then
 		grant_ro_access "$HOME"
 	else
 		raw_grant "$HOME"
 	fi
 	# downloads folder access
-	if sandbox_param_allowed "allowdownloads" >/dev/null; then
-		if [[ "$IS_EPHEMERAL" ]]; then
+	if [[ -n "$(sandbox_param_allowed "allowdownloads")" ]]; then
+		if [[ -n "$IS_EPHEMERAL" ]]; then
 			grant_ro_access "$HOME/Downloads"
 		else
 			grant_home_rw_access "Downloads"
 		fi
 	fi
 	# custom defined access
-	for path in "$HOME_RW_ACCESS"; do
-		if [[ "$IS_EPHEMERAL" ]]; then
+	for path in $HOME_RW_ACCESS; do
+		if [[ -n "$IS_EPHEMERAL" ]]; then
 			grant_ro_access "$HOME/$path"
 		else
 			grant_device_access "$path"
@@ -311,11 +280,36 @@ function determine_sandbox_args() {
 	### END_GROUP_X11_WAYLAND_ACCESS
 	
 	### GROUP_DBUS_ACCESS
-	if sandbox_param_enabled "denydbus" >/dev/null; then
+	if [[ -n "$(sandbox_param_enabled "denydbus")" ]]; then
 		grant_ro_access "/run/dbus/system_bus_socket"
 		grant_socket_access "bus"
 	fi
 	### END_GROUP_DBUS_ACCESS
+	
+	case "$EXEC_TYPE" in
+		command)
+			EXEC_NAME="/usr/bin/$EXEC"
+			;;
+		file)
+			grant_ro_access "$EXEC"
+			EXEC_NAME="$EXEC"
+			;;
+		*)
+			echo "ERROR: exec type '$EXEC_TYPE' unknown"
+			exit 0
+			;;
+	esac
+	
+	# mount all nullified dirs read-only
+	# we do this after to allow mounting into those dirs
+	if [[ -n "$NULLIFY_DIRS" ]]; then
+		NULLIFY_DIRS="$(params_list "$NULLIFY_DIRS")"
+		for dir in $NULLIFY_DIRS; do
+			BWRAP_ARGS+=" --remount-ro $dir"
+		done
+	fi
+	# prevent further modifications to the root sandbox environment
+	BWRAP_ARGS+=" --remount-ro /"
 }
 
 determine_sandbox_args
