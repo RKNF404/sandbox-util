@@ -5,6 +5,7 @@ declare -r HOME="$HOME"
 declare -r XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"
 declare -r XAUTHORITY="$XAUTHORITY"
 declare -r XDG_SESSION_TYPE="$XDG_SESSION_TYPE"
+declare -rx PATH="/bin:/usr/bin"
 
 # If we have nothing, do nothing
 [[ ! "$1" || ! "$2" ]] && echo "ERROR: no params provided" && exit 1
@@ -53,7 +54,7 @@ declare -r DEV_ACCESS="$(params_list $SB_DEV_ACCESS)" # grants access to any dev
 declare -r SOCKET_ACCESS="$(params_list $SB_SOCKET_ACCESS)" # XDG_RUNTIME_DIR relative socket access
 
 # Figure out what window system we are using
-declare WINDOW_SYSTEM="${SB_WINDOWING_SYSTEM:-$XDG_SESSION_TYPE}"
+declare WINDOW_SYSTEM="${SB_WINDOW_SYSTEM:-$XDG_SESSION_TYPE}"
 if [[ "$WINDOW_SYSTEM" != "none" && "$WINDOW_SYSTEM" != "any" &&
       "$WINDOW_SYSTEM" != "x11" && "$WINDOW_SYSTEM" != "wayland" ]]; then
 	WINDOW_SYSTEM="$XDG_SESSION_TYPE"
@@ -76,33 +77,36 @@ function sandbox_param_enabled() {
 # Similar to sandbox_param_enabled except it is off by default and is used for grants rather than restrictions
 # - denying is enforced
 function sandbox_param_allowed() {
-	[[ -z "$(sandbox_param_present "no$1")" && -n "$(sandbox_param_present "$1")" ]] && echo "$1"
+	if [[ -z "$(sandbox_param_present "no$1")" && -z "$(sandbox_param_present "sandbox")" ]]; then
+		[[ -n "$(sandbox_param_present "$1")" ]] && echo "$1"
+	fi
 }
 
 # Some general purpose access functions
+declare NULLIFY_DIRS="/"
 function raw_grant() {
-	[[ -f "$1" || -d "$1" ]] && BWRAP_ARGS+=" --bind $1 $1" # unfiltered grant, avoid usage if possible
+	BWRAP_ARGS+=" --bind-try $1 $1" # unfiltered grant, avoid usage if possible
 }
 function grant_ro_access() {
-	[[ -f "$1" || -d "$1" ]] && BWRAP_ARGS+=" --ro-bind $1 $1"
+	BWRAP_ARGS+=" --ro-bind-try $1 $1"
 }
 function clear_dir() {
-	[[ -d "$1" ]] && BWRAP_ARGS+=" --perms 444 --tmpfs $1"
+	BWRAP_ARGS+=" --perms 555 --tmpfs $1"
 }
 function grant_device_access() {
-	[[ -f "$1" || -d "$1" ]] && BWRAP_ARGS+=" --dev-bind /dev/$1 /dev/$1"
+	BWRAP_ARGS+=" --dev-bind-try /dev/$1 /dev/$1"
 }
 function nullify_file() {
-	[[ -f "$1" ]] && BWRAP_ARGS+=" --ro-bind /dev/null $1"
+	BWRAP_ARGS+=" --ro-bind-try /dev/null $1"
 }
 function nullify_dir() {
-	[[ -d "$1" ]] && clear_dir "$1" && NULLIFY_DIRS+="$1,"
+	clear_dir "$1" && NULLIFY_DIRS+=",$1"
 }
 function grant_home_rw_access() {
-	[[ -f "$1" || -d "$1" ]] && raw_grant "$HOME/$1"
+	raw_grant "$HOME/$1"
 }
 function grant_socket_access() {
-	[[ -f "$1" || -d "$1" ]] && grant_ro_access "$XDG_RUNTIME_DIR/$1"
+	grant_ro_access "$XDG_RUNTIME_DIR/$1"
 }
 
 # General sandbox function
@@ -124,33 +128,38 @@ function determine_sandbox_args() {
 	### GROUP_RO_ACCESS
 	# prevent system ld preload
 	[[ -n "$(sandbox_param_enabled "preventpreload")" ]] && nullify_file "/etc/ld.so.preload"
-	# /usr access (mandatory)
-	grant_ro_access "/usr"
-	grant_ro_access "/usr/bin"
+	# /usr access
+	if [[ -n "$(sandbox_param_enabled "hideusr")" ]]; then
+		nullify_dir "/usr"
+	else
+		grant_ro_access "/usr"
+	fi
+	# /bin access
+	if [[ -n "$(sandbox_param_enabled "hidebin")" ]]; then
+		nullify_dir "/usr/bin"
+	else
+		grant_ro_access "/usr/bin"
+	fi
 	# /sbin access
 	if [[ -n "$(sandbox_param_enabled "hidesbin")" ]]; then
 		nullify_dir "/usr/sbin"
 	else
 		grant_ro_access "/usr/sbin"
 	fi
-	# /lib64 and /lib access
-	if [[ -n "$(sandbox_param_enabled "hidelib")" ]]; then
-		nullify_dir "/usr/lib64"
-		nullify_dir "/usr/lib"
-	else
-		grant_ro_access "/usr/lib64"
-		grant_ro_access "/usr/lib"
-	fi
+	# /libexec access
 	if [[ -n "$(sandbox_param_enabled "hidelibexec")" ]]; then
 		nullify_dir "/usr/libexec"
 	else
 		grant_ro_access "/usr/libexec"
 	fi
+	# /lib64 and /lib access
+	grant_ro_access "/usr/lib64"
+	grant_ro_access "/usr/lib"
 	# On Fedora, these dirs are symlinked
-	BWRAP_ARGS+=" --ro-bind /usr/bin /bin"
-	BWRAP_ARGS+=" --ro-bind /usr/sbin /sbin"
-	BWRAP_ARGS+=" --ro-bind /usr/lib64 /lib64"
-	BWRAP_ARGS+=" --ro-bind /usr/lib /lib"
+	BWRAP_ARGS+=" --symlink /usr/bin /bin"
+	BWRAP_ARGS+=" --symlink /usr/sbin /sbin"
+	BWRAP_ARGS+=" --symlink /usr/lib64 /lib64"
+	BWRAP_ARGS+=" --symlink /usr/lib /lib"
 	# /etc access
 	if [[ -n "$(sandbox_param_enabled "hideetc")" ]]; then
 		nullify_dir "/etc"
@@ -198,8 +207,9 @@ function determine_sandbox_args() {
 	# pipewire access
 	[[ -n "$(sandbox_param_allowed "allowpipewire")" ]] && grant_socket_access "pipewire-0"
 	# pulseaudio access
-	[[ -n "$(sandbox_param_allowed "allowpulse")" ]] && grant_socket_access "pulse"
-	if sandbox_param_allowed "allowdconf" >/dev/null; then
+	[[ -n "$(sandbox_param_allowed "allowpulseaudio")" ]] && grant_socket_access "pulse"
+	# dconf access
+	if [[ -n "$(sandbox_param_allowed "allowdconf")" ]]; then
 		if [[ -n "$IS_EPHEMERAL" ]]; then
 			grant_socket_access "dconf"
 		else
@@ -243,7 +253,7 @@ function determine_sandbox_args() {
 	else
 		raw_grant "$HOME"
 	fi
-	# downloads folder access
+	# downloads access
 	if [[ -n "$(sandbox_param_allowed "allowdownloads")" ]]; then
 		if [[ -n "$IS_EPHEMERAL" ]]; then
 			grant_ro_access "$HOME/Downloads"
@@ -256,7 +266,7 @@ function determine_sandbox_args() {
 		if [[ -n "$IS_EPHEMERAL" ]]; then
 			grant_ro_access "$HOME/$path"
 		else
-			grant_device_access "$path"
+			grant_home_rw_access "$path"
 		fi
 	done
 	### END_GROUP_HOME_RW_ACCESS
@@ -269,29 +279,32 @@ function determine_sandbox_args() {
 	else
 		BWRAP_ARGS+=" --unsetenv DISPLAY"
 		BWRAP_ARGS+=" --unsetenv XAUTHORITY"
+		nullify_file "$XAUTHORITY"
 		nullify_dir "/tmp/.X11-unix"
 	fi
 	# wayland socket access
 	if [[ "$WINDOW_SYSTEM" == "wayland" || "$WINDOW_SYSTEM" == "any" ]]; then
 		grant_socket_access "wayland-0"
 	else
+		BWRAP_ARGS+=" --unsetenv WAYLAND_DISPLAY"
 		nullify_file "$XDG_RUNTIME_DIR/wayland-0"
 	fi
 	### END_GROUP_X11_WAYLAND_ACCESS
 	
 	### GROUP_DBUS_ACCESS
-	if [[ -n "$(sandbox_param_enabled "denydbus")" ]]; then
+	if [[ -n "$(sandbox_param_allowed "allowdbus")" ]]; then
 		grant_ro_access "/run/dbus/system_bus_socket"
 		grant_socket_access "bus"
 	fi
+	# TODO: Implement xdg-dbus-proxy
 	### END_GROUP_DBUS_ACCESS
 	
+	# Grant access to the binary
 	case "$EXEC_TYPE" in
 		command)
 			EXEC_NAME="/usr/bin/$EXEC"
 			;;
 		file)
-			grant_ro_access "$EXEC"
 			EXEC_NAME="$EXEC"
 			;;
 		*)
@@ -299,6 +312,7 @@ function determine_sandbox_args() {
 			exit 0
 			;;
 	esac
+	grant_ro_access "$EXEC_NAME"
 	
 	# mount all nullified dirs read-only
 	# we do this after to allow mounting into those dirs
@@ -308,8 +322,6 @@ function determine_sandbox_args() {
 			BWRAP_ARGS+=" --remount-ro $dir"
 		done
 	fi
-	# prevent further modifications to the root sandbox environment
-	BWRAP_ARGS+=" --remount-ro /"
 }
 
 determine_sandbox_args
